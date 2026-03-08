@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-arXiv + Semantic Scholar 混合架构论文搜索脚本
+arXiv + Semantic Scholar + medRxiv 混合架构论文搜索脚本
 用于 start-my-day skill，搜索最近一个月和最近一年的极火、极热门、极优质论文
 """
 
@@ -36,6 +36,9 @@ ARXIV_NS = {
 
 SEMANTIC_SCHOLAR_API_URL = "https://api.semanticscholar.org/graph/v1/paper/search"
 SEMANTIC_SCHOLAR_FIELDS = "title,abstract,publicationDate,citationCount,influentialCitationCount,url,authors,externalIds"
+
+MEDRXIV_API_URL = "https://api.medrxiv.org/details/medrxiv"
+MEDRXIV_PAGE_SIZE = 30  # API 每页最多返回 30 条
 
 ARXIV_CATEGORY_KEYWORDS = {
     "cs.AI": "artificial intelligence",
@@ -173,12 +176,18 @@ def search_arxiv_by_date_range(
     Returns:
         论文列表
     """
+    # 过滤空分类字符串，避免生成非法 API query
+    categories = [c for c in categories if c.strip()]
+    if not categories:
+        logger.warning("[arXiv] No categories specified, skipping search")
+        return []
+
     # 构建分类查询
     category_query = "+OR+".join([f"cat:{cat}" for cat in categories])
-    
+
     # 构建日期范围查询 (arXiv 使用 YYYYMMDD 格式)
     date_query = f"submittedDate:[{start_date.strftime('%Y%m%d')}0000+TO+{end_date.strftime('%Y%m%d')}2359]"
-    
+
     # 组合查询
     full_query = f"({category_query})+AND+{date_query}"
     
@@ -382,6 +391,105 @@ def search_hot_papers_from_categories(
     all_hot_papers.sort(key=lambda x: x.get("influentialCitationCount", 0), reverse=True)
     
     return all_hot_papers
+
+
+def search_medrxiv_by_date_range(
+    categories: List[str],
+    start_date: datetime,
+    end_date: datetime,
+    max_results: int = 100,
+    max_retries: int = 3
+) -> List[Dict]:
+    """
+    使用 medRxiv API 搜索指定日期范围内的论文
+
+    Args:
+        categories: medRxiv 分类列表（如 ["epidemiology", "health informatics"]），
+                    空列表表示不按分类过滤（搜索所有分类）
+        start_date: 开始日期
+        end_date: 结束日期
+        max_results: 最大结果数
+        max_retries: 最大重试次数
+
+    Returns:
+        论文列表（统一格式）
+    """
+    interval = f"{start_date.strftime('%Y-%m-%d')}/{end_date.strftime('%Y-%m-%d')}"
+    logger.info("[medRxiv] Searching papers from %s to %s", start_date.date(), end_date.date())
+
+    all_papers: List[Dict] = []
+    cursor = 0
+
+    while len(all_papers) < max_results:
+        url = f"{MEDRXIV_API_URL}/{interval}/{cursor}/json"
+        logger.debug("[medRxiv] URL: %s", url)
+
+        data = None
+        for attempt in range(max_retries):
+            try:
+                with urllib.request.urlopen(url, timeout=60) as response:
+                    data = json.loads(response.read().decode('utf-8'))
+                break
+            except Exception as e:
+                logger.warning("[medRxiv] Error (attempt %d/%d): %s", attempt + 1, max_retries, e)
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt * 2)
+        if data is None:
+            logger.error("[medRxiv] Failed after %d attempts", max_retries)
+            break
+
+        messages = data.get("messages", [])
+        total = messages[0].get("total", 0) if messages else 0
+        collection = data.get("collection", [])
+
+        if not collection:
+            break
+
+        for item in collection:
+            paper_category = item.get("category", "").lower()
+
+            # 如果指定了分类，进行过滤
+            if categories:
+                cat_lower = [c.lower() for c in categories]
+                if not any(c in paper_category or paper_category in c for c in cat_lower):
+                    continue
+
+            doi = item.get("doi", "")
+            version = item.get("version", "1")
+            date_str = item.get("date", "")
+
+            paper: Dict = {
+                "source": "medrxiv",
+                "doi": doi,
+                "title": item.get("title", "").strip(),
+                "summary": item.get("abstract", "").strip(),
+                "authors": [a.strip() for a in item.get("authors", "").split(";") if a.strip()],
+                "published": date_str,
+                "categories": [paper_category] if paper_category else [],
+                "medrxiv_category": item.get("category", ""),
+                "url": f"https://www.medrxiv.org/content/{doi}v{version}",
+                "pdf_url": f"https://www.medrxiv.org/content/{doi}v{version}.full.pdf",
+                "published_date": None,
+            }
+
+            if date_str:
+                try:
+                    paper["published_date"] = datetime.strptime(date_str, "%Y-%m-%d")
+                except (ValueError, TypeError):
+                    pass
+
+            all_papers.append(paper)
+
+        cursor += len(collection)
+        logger.info("[medRxiv] Fetched %d / %d papers (cursor=%d)", len(all_papers), total, cursor)
+
+        if cursor >= total:
+            break
+
+        time.sleep(1)  # 礼貌性速率限制
+
+    logger.info("[medRxiv] Found %d papers after filtering", len(all_papers))
+    return all_papers[:max_results]
 
 
 def parse_arxiv_xml(xml_content: str) -> List[Dict]:
@@ -774,6 +882,15 @@ def main():
                         help='Comma-separated list of arXiv categories')
     parser.add_argument('--skip-hot-papers', action='store_true',
                         help='Skip searching hot papers from Semantic Scholar')
+    parser.add_argument('--medrxiv-categories', type=str,
+                        default='',
+                        help='Comma-separated list of medRxiv categories to filter '
+                             '(e.g. "epidemiology,health informatics"). '
+                             'Leave empty to search all medRxiv categories.')
+    parser.add_argument('--skip-medrxiv', action='store_true',
+                        help='Skip searching papers from medRxiv')
+    parser.add_argument('--medrxiv-max-results', type=int, default=100,
+                        help='Maximum number of results to fetch from medRxiv')
 
     args = parser.parse_args()
 
@@ -809,12 +926,16 @@ def main():
     logger.info("  Recent 30 days: %s to %s", window_30d_start.date(), window_30d_end.date())
     logger.info("  Past year (31-365 days): %s to %s", window_1y_start.date(), window_1y_end.date())
 
-    # 解析分类
-    categories = args.categories.split(',')
+    # 解析分类（过滤空字符串）
+    categories = [c.strip() for c in args.categories.split(',') if c.strip()]
+
+    # 解析 medRxiv 分类
+    medrxiv_categories = [c.strip() for c in args.medrxiv_categories.split(',') if c.strip()]
 
     all_scored_papers = []
     recent_papers = []
     hot_papers = []
+    medrxiv_papers = []
 
     # ========== 第一步：搜索最近30天的论文（arXiv）==========
     logger.info("=" * 70)
@@ -839,6 +960,37 @@ def main():
         all_scored_papers.extend(scored_recent)
     else:
         logger.warning("No recent papers found")
+
+    # ========== 第一步半：搜索最近30天的 medRxiv 论文 ==========
+    if not args.skip_medrxiv:
+        logger.info("=" * 70)
+        logger.info("Step 1.5: Searching recent papers (last 30 days) from medRxiv")
+        if medrxiv_categories:
+            logger.info("  Categories: %s", ', '.join(medrxiv_categories))
+        else:
+            logger.info("  Categories: all (no filter)")
+        logger.info("=" * 70)
+
+        medrxiv_papers = search_medrxiv_by_date_range(
+            categories=medrxiv_categories,
+            start_date=window_30d_start,
+            end_date=window_30d_end,
+            max_results=args.medrxiv_max_results
+        )
+
+        if medrxiv_papers:
+            scored_medrxiv = filter_and_score_papers(
+                papers=medrxiv_papers,
+                config=config,
+                target_date=target_date,
+                is_hot_paper_batch=False
+            )
+            logger.info("Scored %d medRxiv papers", len(scored_medrxiv))
+            all_scored_papers.extend(scored_medrxiv)
+        else:
+            logger.warning("No medRxiv papers found")
+    else:
+        logger.info("Skipping medRxiv search (disabled by user)")
 
     # ========== 第二步：搜索过去一年的高影响力论文（Semantic Scholar）==========
     if not args.skip_hot_papers:
@@ -875,21 +1027,21 @@ def main():
     # 按推荐评分排序
     all_scored_papers.sort(key=lambda x: x['scores']['recommendation'], reverse=True)
     
-    # 去重（基于 arXiv ID）
+    # 去重（arXiv 用 arxiv_id，medRxiv 用 doi，其余用标题）
     seen_ids = set()
     unique_papers = []
     for p in all_scored_papers:
         arxiv_id = p.get('arxiv_id') or p.get('arxivId')
+        doi = p.get('doi')
         if arxiv_id:
-            if arxiv_id not in seen_ids:
-                seen_ids.add(arxiv_id)
-                unique_papers.append(p)
+            key = f"arxiv:{arxiv_id}"
+        elif doi:
+            key = f"doi:{doi}"
         else:
-            # 没有 arXiv ID 的，使用标题去重
-            title = p.get('title', '')
-            if title not in seen_ids:
-                seen_ids.add(title)
-                unique_papers.append(p)
+            key = p.get('title', '')
+        if key not in seen_ids:
+            seen_ids.add(key)
+            unique_papers.append(p)
     
     logger.info("Total unique papers after deduplication: %d", len(unique_papers))
 
@@ -914,6 +1066,7 @@ def main():
             }
         },
         'total_recent': len(recent_papers),
+        'total_medrxiv': len(medrxiv_papers),
         'total_hot': len(hot_papers),
         'total_unique': len(unique_papers),
         'top_papers': top_papers

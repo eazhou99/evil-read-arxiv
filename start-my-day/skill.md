@@ -58,7 +58,10 @@ python scripts/search_arxiv.py \
   --output arxiv_filtered.json \
   --max-results 200 \
   --top-n 10 \
-  --categories "cs.AI,cs.LG,cs.CL,cs.CV,cs.MM,cs.MA,cs.RO"
+  --categories "cs.AI,cs.LG,cs.CL,cs.CV,cs.MM,cs.MA,cs.RO" \
+  --medrxiv-max-results 100
+  # 可选：--skip-medrxiv 跳过 medRxiv 搜索
+  # 可选：--medrxiv-categories "epidemiology,health informatics" 按分类过滤
 ```
 
 **脚本功能**：
@@ -66,11 +69,16 @@ python scripts/search_arxiv.py \
    - 调用 arXiv API 搜索指定分类的论文
    - 获取最多 200 篇最新论文
 
-2. **解析 XML 结果**
-   - 解析 API 返回的 XML
-   - 提取：ID、标题、作者、摘要、发布日期、分类
+2. **搜索 medRxiv**（默认启用，`--skip-medrxiv` 可跳过）
+   - 调用 medRxiv REST API 搜索最近30天的预印本
+   - 可选 `--medrxiv-categories` 按医学分类过滤（如 "epidemiology,oncology"）
+   - 默认不过滤分类，搜索全部
 
-3. **应用筛选和评分**
+3. **解析结果**
+   - 解析 arXiv XML 和 medRxiv JSON
+   - 提取：ID/DOI、标题、作者、摘要、发布日期、分类
+
+4. **应用筛选和评分**
    - 根据研究兴趣配置文件筛选论文
    - 计算综合推荐评分（相关性40%、新近性20%、热门度30%、质量10%）
    - 按评分排序，保留前10篇
@@ -432,6 +440,7 @@ python scripts/link_keywords.py \
      --max-results 200 \
      --top-n 10 \
      --categories "cs.AI,cs.LG,cs.CL,cs.CV,cs.MM,cs.MA,cs.RO" \
+     --medrxiv-max-results 100 \
      --target-date "{目标日期}"  # 如果用户指定了日期，替换为实际日期
    ```
 
